@@ -1,17 +1,27 @@
 #!/usr/bin/env python3
 """
-Generate Triton config.pbtxt + adapter.yaml (v2) for a detection ONNX model.
+Generate Triton config.pbtxt + adapter.yaml for a detection ONNX model.
+Supports all three adapter schema versions consumed by the Savant worker:
+
+    v1 — flat alert_labels + alert_category/alert_severity
+    v2 — per-label alert_rules (presence/absence) with optional default_alert
+    v3 — typed alert_rules (zones, dwell, gathering, temporal) + OC-SORT tracker
+
 Files are saved in the SAME folder as the model.onnx by default.
 
 Usage:
     python generate_model_package.py --model fire_model/model.onnx
-    python generate_model_package.py --model helmet/best_trained.onnx
+    python generate_model_package.py --model helmet/best_trained.onnx --schema 1
+    python generate_model_package.py --model cabin/model.onnx --schema 3
     python generate_model_package.py --model fire_model/model.onnx --inspect-only
     python generate_model_package.py --model fire_model/model.onnx --force
+
+When --schema is omitted the wizard asks which version to emit (default 3).
 """
 from __future__ import annotations
 
 import argparse
+import re
 import sys
 from pathlib import Path
 
@@ -37,6 +47,27 @@ from inspect_model import (
 VALID_SEVERITIES     = ["low", "medium", "high", "critical"]
 VALID_MODES          = ["presence", "absence", "absence_unconditional"]
 VALID_INSTANCE_KINDS = ["KIND_CPU", "KIND_GPU"]
+
+# ── v3 rule schema (mirrors V3_RULE_TYPES in savant_worker.py) ──────────────────
+# rule type -> type-specific required fields (besides rule_id + type)
+V3_RULE_FIELDS = {
+    "presence":               [],
+    "absence":                [],
+    "absence_unconditional":  [],
+    "temporal_presence":      ["min_consecutive_frames"],
+    "zone_violation":         ["zone_id", "person_label"],
+    "zone_duration":          ["zone_id", "person_label", "duration_seconds"],
+    "zone_absence":           ["zone_id", "absent_label", "guard_label"],
+    "gathering":              ["min_count", "duration_seconds"],
+}
+# rule types that need a `label` field drawn from the model's labels list
+V3_LABEL_REQUIRED   = {"presence", "absence", "absence_unconditional",
+                       "temporal_presence", "gathering"}
+# rule types that require tracker.enabled: true
+V3_TRACKER_RULES    = {"zone_duration", "gathering"}
+# rule fields that must reference an entry in the labels list
+V3_LABEL_FIELDS     = ("label", "person_label", "absent_label", "guard_label")
+SLUG_RE             = re.compile(r"^[a-z0-9_]+$")
 
 BOLD = "\033[1m"; CYAN = "\033[96m"; GREEN = "\033[92m"; YELLOW = "\033[93m"; RESET = "\033[0m"
 h    = lambda t: f"{BOLD}{CYAN}{t}{RESET}"
@@ -65,6 +96,29 @@ def ask_float(prompt: str, default: float) -> float:
         if not raw: return default
         try: return float(raw)
         except ValueError: print("  ✗ Enter a number.")
+
+
+def ask_int(prompt: str, default: int) -> int:
+    while True:
+        raw = input(f"  {prompt} [{default}]: ").strip()
+        if not raw: return default
+        try:
+            v = int(raw)
+            if v <= 0: print("  ✗ Must be a positive integer."); continue
+            return v
+        except ValueError: print("  ✗ Enter a whole number.")
+
+
+def ask_slug(prompt: str, default: str = "") -> str:
+    dh = f" [{default}]" if default else ""
+    while True:
+        raw = input(f"  {prompt}{dh}: ").strip()
+        val = raw or default
+        if not val:
+            print("  ✗ Required."); continue
+        if not SLUG_RE.match(val):
+            print("  ✗ Lowercase letters, digits and underscores only."); continue
+        return val
 
 
 def ask_bool(prompt: str, default: bool = True) -> bool:
@@ -162,23 +216,136 @@ def alert_wizard(labels: list[str]) -> tuple[list[dict], dict | None, list[str]]
     return rules, default_alert, alert_labels
 
 
+# ── v1 alert wizard ─────────────────────────────────────────────────────────
+
+def alert_wizard_v1(labels: list[str]) -> tuple[list[str], str, str]:
+    """schema_version=1: one flat set of alert_labels + a single category/severity."""
+    print(f"\n{h('─' * 55)}\n{h('Alert Settings (v1)')}")
+    print(f"  Labels: {ok(', '.join(labels))}\n")
+    raw = input("  alert_labels (comma-separated subset, Enter = all labels): ").strip()
+    if not raw:
+        alert_labels = list(labels)
+    else:
+        wanted = [l.strip() for l in raw.split(",") if l.strip()]
+        unknown = [l for l in wanted if l not in labels]
+        if unknown:
+            print(warn(f"  ⚠ Ignoring unknown labels: {', '.join(unknown)}"))
+        alert_labels = [l for l in wanted if l in labels] or list(labels)
+    category = ask("alert_category", default="detection")
+    severity = ask("alert_severity", default="medium", choices=VALID_SEVERITIES)
+    return alert_labels, category, severity
+
+
+# ── v3 alert wizard ─────────────────────────────────────────────────────────
+
+def _one_rule_v3(labels: list[str], index: int) -> dict:
+    print(f"\n  {h(f'Rule #{index}')}")
+    rtype = ask("rule type", default="presence", choices=sorted(V3_RULE_FIELDS))
+    rule_id = ask("rule_id", default=f"{rtype}_{index}")
+    rule: dict = {"rule_id": rule_id, "type": rtype}
+
+    if rtype in V3_LABEL_REQUIRED:
+        rule["label"] = ask("label (detection class)", default=labels[0], choices=labels)
+
+    for field in V3_RULE_FIELDS[rtype]:
+        if field == "zone_id":
+            rule[field] = ask_slug("zone_id (must match a zone drawn in the dashboard)")
+        elif field in ("person_label", "absent_label", "guard_label"):
+            rule[field] = ask(field, default=labels[0], choices=labels)
+        elif field == "min_consecutive_frames":
+            rule[field] = ask_int("min_consecutive_frames", default=3)
+        elif field == "min_count":
+            rule[field] = ask_int("min_count (people in cluster)", default=4)
+        elif field == "duration_seconds":
+            rule[field] = ask_float("duration_seconds", default=15.0)
+
+    if rtype == "gathering":
+        rule["cluster_eps"]         = ask_float("cluster_eps (image-space distance)", default=0.0625)
+        rule["grace_seconds"]       = ask_float("grace_seconds", default=1.0)
+        rule["group_match_jaccard"] = ask_float("group_match_jaccard", default=0.4)
+
+    rule["category"]         = ask("category", default="safety")
+    rule["severity"]         = ask("severity", default="high", choices=VALID_SEVERITIES)
+    rule["cooldown_seconds"] = int(ask_float("cooldown_seconds", default=30))
+    default_msg = f"{rule.get('label', rtype)} on camera {{camera}} ({{stream_key}})"
+    rule["message"] = ask("message  ({camera} {stream_key} {label} {model})", default=default_msg)
+    return rule
+
+
+def alert_wizard_v3(labels: list[str]) -> list[dict]:
+    print(f"\n{h('─' * 55)}\n{h('Alert Rules Wizard (v3)')}")
+    print(f"  Labels: {ok(', '.join(labels))}")
+    print("  Rule types: " + ok(", ".join(sorted(V3_RULE_FIELDS))))
+    print(f"  Zone/dwell/gathering rules need zones drawn in the dashboard "
+          f"(zone_id matches the slug there).\n")
+
+    rules: list[dict] = []
+    index = 1
+    while True:
+        if rules and not ask_bool("Add another rule?", default=False):
+            break
+        if not rules and not ask_bool("Add an alert rule?", default=True):
+            break
+        rules.append(_one_rule_v3(labels, index))
+        index += 1
+    return rules
+
+
+def tracker_wizard(force_enabled: bool) -> dict:
+    print(f"\n{h('─' * 55)}\n{h('Tracker (OC-SORT)')}")
+    if force_enabled:
+        print(ok("  zone_duration / gathering rules present → tracker.enabled forced to true"))
+        enabled = True
+    else:
+        enabled = ask_bool("Enable the OC-SORT tracker?", default=True)
+    if not enabled:
+        return {"enabled": False}
+    return {
+        "enabled":              True,
+        "type":                 "ocsort",
+        "max_age":              ask_int("tracker max_age (frames to keep lost tracks)", default=30),
+        "min_hits":             ask_int("tracker min_hits (frames before a track is confirmed)", default=3),
+        "grace_period_seconds": ask_float("tracker grace_period_seconds (occlusion tolerance)", default=2.0),
+    }
+
+
 # ── Build adapter dict ────────────────────────────────────────────────────────
 
-def build_adapter(
-    *, decoder, labels, layout, color_order, scale, mean, std,
+def _base_adapter(
+    *, schema_version, decoder, labels, layout, color_order, scale, mean, std,
     input_size, confidence_threshold, nms_threshold,
-    alert_rules, default_alert, alert_labels,
 ) -> dict:
     pre: dict = {"layout": layout, "color_order": color_order,
                  "scale": scale, "mean": mean, "std": std}
     if input_size: pre["input_size"] = input_size
-    a: dict = {
-        "schema_version": 2, "task_type": "detection", "decoder": decoder,
+    return {
+        "schema_version": schema_version, "task_type": "detection", "decoder": decoder,
         "preprocess": pre,
         "postprocess": {"confidence_threshold": confidence_threshold,
                         "nms_threshold": nms_threshold},
         "labels": labels,
     }
+
+
+def build_adapter_v1(
+    *, alert_labels, alert_category, alert_severity, **base,
+) -> dict:
+    a = _base_adapter(schema_version=1, **base)
+    a["alert_labels"]   = alert_labels
+    a["alert_category"] = alert_category
+    a["alert_severity"] = alert_severity
+    return a
+
+
+def build_adapter_v3(*, tracker, alert_rules, **base) -> dict:
+    a = _base_adapter(schema_version=3, **base)
+    if tracker:     a["tracker"]     = tracker
+    if alert_rules: a["alert_rules"] = alert_rules
+    return a
+
+
+def build_adapter(*, alert_rules, default_alert, alert_labels, **base) -> dict:
+    a = _base_adapter(schema_version=2, **base)
     if default_alert: a["default_alert"] = default_alert
     if alert_labels:  a["alert_labels"]  = alert_labels
     if alert_rules:   a["alert_rules"]   = alert_rules
@@ -202,6 +369,8 @@ def main() -> int:
     p.add_argument("--decoder",       default="auto",
                    choices=["auto", "yolo_v8", "yolo_single_class", "ssd"])
     p.add_argument("--instance-kind", default="KIND_CPU", choices=VALID_INSTANCE_KINDS)
+    p.add_argument("--schema",        choices=["1", "2", "3"],
+                   help="Adapter schema version to emit. Default: ask (3).")
     p.add_argument("--inspect-only",  action="store_true")
     p.add_argument("--force",         action="store_true", help="Overwrite existing files.")
     args = p.parse_args()
@@ -289,16 +458,48 @@ def main() -> int:
     print(f"\n{h('── 6. Instance group ──')}")
     kind = ask("Instance kind", default=args.instance_kind, choices=VALID_INSTANCE_KINDS)
 
-    alert_rules, default_alert, alert_labels = alert_wizard(labels)
+    print(f"\n{h('── 7. Adapter schema version ──')}")
+    print("  1 = flat alert_labels   2 = presence/absence rules   3 = zones/dwell/gathering")
+    schema = int(args.schema) if args.schema else int(
+        ask("Schema version", default="3", choices=["1", "2", "3"])
+    )
 
-    # ── Write ────────────────────────────────────────────────────────────────
-    pbtxt   = build_pbtxt(model_name, onnx_info, instance_kind=kind)
-    adapter = build_adapter(
+    # ── Alert configuration (per schema version) ──────────────────────────────
+    base_kwargs = dict(
         decoder=decoder, labels=labels, layout=layout, color_order=color_order,
         scale=scale, mean=mean, std=std, input_size=input_size,
         confidence_threshold=conf, nms_threshold=nms,
-        alert_rules=alert_rules, default_alert=default_alert, alert_labels=alert_labels,
     )
+
+    if schema == 1:
+        alert_labels, alert_category, alert_severity = alert_wizard_v1(labels)
+        adapter = build_adapter_v1(
+            alert_labels=alert_labels, alert_category=alert_category,
+            alert_severity=alert_severity, **base_kwargs,
+        )
+        summary = f"  Alert labels: {len(alert_labels)}  |  {alert_category}/{alert_severity}"
+    elif schema == 2:
+        alert_rules, default_alert, alert_labels = alert_wizard(labels)
+        adapter = build_adapter(
+            alert_rules=alert_rules, default_alert=default_alert,
+            alert_labels=alert_labels, **base_kwargs,
+        )
+        n_r, n_d = len(alert_rules), len(alert_labels)
+        summary = f"  Alert rules : {n_r} explicit" + (f", {n_d} via default_alert" if n_d else "")
+    else:  # schema == 3
+        alert_rules = alert_wizard_v3(labels)
+        needs_tracker = any(r["type"] in V3_TRACKER_RULES for r in alert_rules)
+        tracker = tracker_wizard(needs_tracker)
+        adapter = build_adapter_v3(tracker=tracker, alert_rules=alert_rules, **base_kwargs)
+        by_type: dict[str, int] = {}
+        for r in alert_rules:
+            by_type[r["type"]] = by_type.get(r["type"], 0) + 1
+        types_str = ", ".join(f"{k}×{v}" for k, v in by_type.items()) or "none"
+        summary = (f"  Alert rules : {len(alert_rules)} ({types_str})\n"
+                   f"  Tracker     : {'ocsort' if tracker.get('enabled') else 'disabled'}")
+
+    # ── Write ────────────────────────────────────────────────────────────────
+    pbtxt = build_pbtxt(model_name, onnx_info, instance_kind=kind)
     cfg_path.write_text(pbtxt, encoding="utf-8")
     with adapter_path.open("w", encoding="utf-8") as fh:
         yaml.dump(adapter, fh, allow_unicode=True, sort_keys=False, default_flow_style=False)
@@ -310,9 +511,9 @@ def main() -> int:
     print(f"  {ok('config.pbtxt')}  → {cfg_path}")
     print(f"  {ok('adapter.yaml')} → {adapter_path}")
     print(f"  Model name  : {model_name}")
+    print(f"  Schema      : v{schema}")
     print(f"  Decoder     : {decoder}  |  Labels: {len(labels)}")
-    n_r, n_d = len(alert_rules), len(alert_labels)
-    print(f"  Alert rules : {n_r} explicit" + (f", {n_d} via default_alert" if n_d else ""))
+    print(summary)
     print(f"\n{h('Next:')}")
     print("  Dashboard → AI Models → Add → upload model.onnx + config.pbtxt + adapter.yaml")
     print()
